@@ -1,0 +1,807 @@
+// Temperature / Humidity / Light level logger
+//
+// Author: Nick Gammon
+// Date:   1 August 2013
+
+// Use Lilypad Arduino w / Atmega328 board type
+
+// Version 1.01 - added correct date/time to disk file.
+// Version 1.02 - added daylight saving time switch (D9)
+// Version 1.03 - improved DST calculations (to allow for day/month/year rollover)
+// Version 1.04 - fixed compiler errors in newer version of IDE
+
+/*
+
+ PERMISSION TO DISTRIBUTE
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+ and associated documentation files (the "Software"), to deal in the Software without restriction,
+ including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
+ subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+
+
+ LIMITATION OF LIABILITY
+
+ The software is provided "as is", without warranty of any kind, express or implied,
+ including but not limited to the warranties of merchantability, fitness for a particular
+ purpose and noninfringement. In no event shall the authors or copyright holders be liable
+ for any claim, damages or other liability, whether in an action of contract,
+ tort or otherwise, arising from, out of or in connection with the software
+ or the use or other dealings in the software.
+
+
+  Pins:
+    D0 - Serial Rx (connected to FTDI header)
+    D1 - Serial Tx (connected to FTDI header)
+    D2 - switch (to request temperature display)
+    D3 - power-enable (to gate of MOSFET, active low)
+    D4 - warning LED
+    D5 - DHT-22 temperature/humidity sensor
+    D6 - MAX7219 LOAD (/CS) line (active low)
+    D7 - MAX7219 DIN  (data in)
+    D8 - MAX7219 CLK  (clock)
+    D9 - daylight savings time switch
+
+    D10 - SD card SS (slave select)
+    D11 - SD card MOSI
+    D12 - SD card MISO
+    D13 - SD card SCK
+
+    A0  - Thermistor
+    A1  - LDR (light dependent resistor)
+    A2  - unused
+    A3  - unused
+    A4  - I2C SDA (for real-time clock)
+    A5  - I2C SCL (for real-time clock)
+
+  */
+
+
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <avr/power.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <RTClib.h>
+#include <bitBangedSPI.h>
+#include <SdFat.h>
+#include <DHT.h>
+#include <FormatDouble.h>
+
+// pin connections
+
+const byte SWITCH = 2;  // "report readings" switch
+const byte POWER = 3;
+const byte LED = 4;
+const byte DHTPIN = 5;
+const byte DISPLAY_LOAD =  6;  // slave select
+const byte DISPLAY_MOSI = 7;
+const byte DISPLAY_SCK = 8;
+const byte DST = 9;  // "daylight savings time" switch
+const byte SD_CHIP_SELECT = 10;
+const byte THERMISTOR_PIN = 0;  // A0
+const byte LDR_PIN = 1;         // A1
+
+const byte DHTTYPE = DHT22;   // DHT 22  (AM2302)
+
+const char * fileName = "READINGS.TXT";
+const int TIME_TO_SHOW_READINGS = 3000;
+const int TAKE_READINGS_EVERY = 15;    // minutes
+
+unsigned long errorCount;
+unsigned long writeCount;
+
+// MAX7219 display via bit-banged SPI
+bitBangedSPI bbSPI (DISPLAY_MOSI, bitBangedSPI::NO_PIN, DISPLAY_SCK);  // MOSI, MISO, SCK
+
+// Real Time Clock
+RTC_DS1307 RTC;
+// const byte DS1307_ADDRESS = 0x68;  // for checking clock there (I2C address)
+DateTime now;
+byte lastMinute = 99;
+
+// DHT-22 temperature and humidity sensor
+DHT dht (DHTPIN, DHTTYPE, 3);    // 6 for 16 MHz, 3 for 8 Mhz (defines pulse width for zero/one)
+float humidity;
+float temperature;
+char humidityString [10];
+char temperature1String [10];
+char temperature2String [10];
+
+const byte MAX7219_REG_NOOP        = 0x0;
+// codes 1 to 8 are digit positions 1 to 8
+const byte MAX7219_REG_DECODEMODE  = 0x9;
+const byte MAX7219_REG_INTENSITY   = 0xA;
+const byte MAX7219_REG_SCANLIMIT   = 0xB;
+const byte MAX7219_REG_SHUTDOWN    = 0xC;
+const byte MAX7219_REG_DISPLAYTEST = 0xF;
+
+// 7-segments patterns for digits 0 to 9
+const byte digits [10] = {
+  0b1111110,  // 0
+  0b0110000,  // 1
+  0b1101101,  // 2
+  0b1111001,  // 3
+  0b0110011,  // 4
+  0b1011011,  // 5
+  0b1011111,  // 6
+  0b1110000,  // 7
+  0b1111111,  // 8
+  0b1111011,  // 9
+};
+
+volatile boolean buttonPressed;
+
+// Thermistor stuff
+// -----------------------------------------------------
+// Wiring:   Gnd <----> 5K Thermistor <----> |   <----->>   4.7K resistor  <-----> AREF
+//                                           |
+//                                           v
+//                                           A0
+
+
+// temp. for nominal resistance (almost always 25 C)
+const int TEMPERATURENOMINAL = 25;
+
+// resistance at TEMPERATURENOMINAL (above)
+const int THERMISTORNOMINAL = 5000;
+
+// how many samples to take and average, more takes longer but is more 'smooth'
+const int THERMISTOR_SAMPLES = 5;
+
+// The beta coefficient of the thermistor (usually 3000-4000)
+const int BCOEFFICIENT = 3960;
+
+// the value of the 'other' resistor (measure to make sure)
+const int SERIESRESISTOR = 4644;
+
+// how many Kelvin 0 degrees Celsius is
+const float KELVIN = 273.15;
+
+// Code starts here
+// -----------------------------------------------------
+
+void flashLED (const byte times)
+  {
+  // flash LED
+  for (int i = 0; i < times; i++)
+    {
+    digitalWrite (LED, HIGH);
+    delay (20);
+    digitalWrite (LED, LOW);
+    delay (300);
+    }
+  }  // end of flashLED
+
+// send one byte via bit-banged SPI to MAX7219
+void sendByte (const byte reg, const byte data)
+  {
+  digitalWrite (DISPLAY_LOAD, LOW);
+  bbSPI.transfer (reg);
+  bbSPI.transfer (data);
+  digitalWrite (DISPLAY_LOAD, HIGH);
+  }  // end of sendByte
+
+// send one character (data) to position (pos) with or without decimal place
+// pos is 0 to 7
+// data can be '0' to '9' plus various other things as below
+void sendChar (const byte pos, const char data, const bool dp = false)
+  {
+  byte converted;
+  switch (data)
+    {
+    case '0' ... '9' : converted = digits [data - '0']; break;
+    case '-':          converted = 0b0000001;  break;
+    case 'A':          converted = 0b1110111;  break;
+    case 'b':          converted = 0b0011111;  break;
+    case 'c':          converted = 0b0001101;  break;
+    case 'C':          converted = 0b1001110;  break;
+    case 'd':          converted = 0b0111101;  break;
+    case 'E':          converted = 0b1001111;  break;
+    case 'F':          converted = 0b1000111;  break;
+    case 'h':          converted = 0b0010111;  break;
+    case 'H':          converted = 0b0110111;  break;
+    case 'L':          converted = 0b0001110;  break;
+    case 'O':          converted = digits [0]; break;
+    case 'o':          converted = 0b0011101;  break;
+    case 'P':          converted = 0b1100111;  break;
+    case 'r':          converted = 0b0000101;  break;
+    case 'S':          converted = 0b1011011;  break;
+    case 't':          converted = 0b0000111;  break;
+    case 'u':          converted = 0b0011100;  break;
+    case ' ':          converted = 0b0000000;  break;
+    case 'I':          converted = digits [1]; break;
+
+    default:           converted = 0b0000001;  break;  // -
+    } // end of switch
+  if (dp)
+    converted |= 0b10000000;
+  sendByte (8 - pos, converted);
+  }  // end of sendChar
+
+// write an entire null-terminated string to the LEDs
+void sendString (const char * s)
+{
+  byte pos;
+
+  for (pos = 0; pos < 8 && *s; pos++)
+    {
+    boolean dp = s [1] == '.';
+    sendChar (pos, *s++, dp);   // turn decimal place on if next char is a dot
+    if (dp)  // skip dot
+      s++;
+    }
+
+  // space out rest
+  while (pos < 8)
+    sendChar (pos++, ' ');
+}  // end of sendString
+
+
+// watchdog intervals
+// sleep bit patterns for WDTCSR
+enum
+{
+  WDT_16_MS  =  0b000000,
+  WDT_32_MS  =  0b000001,
+  WDT_64_MS  =  0b000010,
+  WDT_128_MS =  0b000011,
+  WDT_256_MS =  0b000100,
+  WDT_512_MS =  0b000101,
+  WDT_1_SEC  =  0b000110,
+  WDT_2_SEC  =  0b000111,
+  WDT_4_SEC  =  0b100000,
+  WDT_8_SEC  =  0b100001,
+ };  // end of WDT intervals enum
+
+// watchdog interrupt
+ISR (WDT_vect)
+  {
+  wdt_disable();  // disable watchdog
+  }
+
+// sleep for "interval" mS as in enum above
+void myWatchdogEnable (const byte interval)
+  {
+  // timed sequence coming up
+  noInterrupts ();
+
+  // clear various "reset" flags
+  MCUSR = 0;
+  // allow changes, disable reset
+  WDTCSR = bit (WDCE) | bit (WDE);
+  // set interrupt mode and an interval
+  WDTCSR = bit (WDIE) | interval;    // set WDIE, and requested delay
+  wdt_reset();  // pat the dog
+
+  // disable ADC
+  byte old_ADCSRA = ADCSRA;
+  ADCSRA = 0;
+  ADMUX = 0;  // turn off internal Vref
+
+  // turn off various modules
+  power_all_disable ();
+
+  // Digital Input Disable Register on analogue pins
+  DIDR0 = bit (ADC0D) | bit (ADC1D) | bit (ADC2D) | bit (ADC3D) | bit (ADC4D) | bit (ADC5D);
+  DIDR1 = bit (AIN1D) | bit (AIN0D);
+
+  buttonPressed = false;
+  attachInterrupt (0, wake, LOW);
+
+  // ready to sleep
+  set_sleep_mode (SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+
+  // turn off brown-out enable in software
+  // BODS must be set to one and BODSE must be set to zero within four clock cycles
+  MCUCR = bit (BODS) | bit (BODSE);
+  // The BODS bit is automatically cleared after three clock cycles
+  MCUCR = bit (BODS);
+  interrupts ();  // one cycle
+  sleep_cpu ();   // one cycle
+
+  // cancel sleep as a precaution
+  sleep_disable();
+  // power-on internal modules
+  power_all_enable ();
+  // put ADC back
+  ADCSRA = old_ADCSRA;
+
+  } // end of myWatchdogEnable
+
+void showError (const char * error)
+{
+  powerOnDisplay ();
+  sendString (error);
+  delay (TIME_TO_SHOW_READINGS);
+  powerOffDisplay ();
+  delay (1000);
+  errorCount++;
+}  // end of showError
+
+void powerOnPeripherals ()
+  {
+  // warning LED
+  pinMode (LED, OUTPUT);
+  digitalWrite (LED, LOW);
+
+  // power MOSFET - initially off
+  digitalWrite (POWER, HIGH);
+  pinMode      (POWER, OUTPUT);
+
+  // DST switch
+  pinMode (DST, INPUT_PULLUP);
+
+  // try to stop display glitching
+  pinMode (DISPLAY_LOAD, OUTPUT);
+  digitalWrite (DISPLAY_LOAD, HIGH);
+  digitalWrite (POWER, LOW);  // turn power ON
+  delay (1); // give time to power up
+
+  // we seem to have occasional random digits appear on the display
+  // so ensure that after power-on it is in shutdown mode
+  bbSPI.begin ();
+  powerOffDisplay ();    // ensure display starts in power-off (shutdown) mode
+  }  // end of powerOnPeripherals
+
+void powerOffPeripherals ()
+  {
+
+  // put all digital pins into low stats
+  for (byte pin = 0; pin < 14; pin++)
+    {
+    digitalWrite (pin, LOW);
+    pinMode (pin, OUTPUT);
+    }
+
+  // except the power pin which has to be high
+  digitalWrite (POWER, HIGH);  // turn power OFF
+  // and activation switch
+  pinMode (SWITCH, INPUT_PULLUP);
+  }  // end of powerOffPeripherals
+
+boolean powerOnRTC ()
+  {
+  Wire.begin();
+  RTC.begin();
+  delay (2);
+  TWBR = 72;  // 50 kHz at 8 MHz clock
+
+  // check RTC is on I2C bus
+  Wire.beginTransmission (DS1307_ADDRESS);
+  Wire.write ((byte) 0);
+  if (Wire.endTransmission () != 0)
+    {
+    showError ("rtc Err1");
+    return false;
+    }
+
+  // check RTC clock responds
+  if (Wire.requestFrom (DS1307_ADDRESS, 1) != 1)
+    {
+    showError ("rtc Err2");
+    return false;
+    }
+
+  Wire.read ();
+
+  // check time is set on the clock
+  if (!RTC.isrunning())
+    {
+    showError ("rtc Err3");
+    return false;
+    }
+
+  return true;
+  }  // powerOnRTC
+
+void powerOffRTC ()
+  {
+  // turn off I2C
+  TWCR &= ~(bit(TWEN) | bit(TWIE) | bit(TWEA));
+
+  // turn off I2C pull-ups
+  digitalWrite (A4, LOW);
+  digitalWrite (A5, LOW);
+  }  // powerOffRTC
+
+unsigned int year;
+byte month, day, hour, minute, second;
+
+boolean getTime ()
+  {
+  boolean ok = false;
+  // try 10 times to get a valid time from the clock
+  for (byte i = 0; i < 10; i++)
+    {
+    if (powerOnRTC ())
+      {
+      now = RTC.now();
+      // sanity check in case RTC returns rubbish
+      if (now.day () >= 1     && now.day () <= 31     &&
+          now.month () >= 1   && now.month () <= 12   &&
+          now.hour () >= 0    && now.hour () <= 23    &&
+          now.minute () >= 0  && now.minute () <= 59  &&
+          now.second () >= 0  && now.second () <= 59)
+          {
+          // copy to global variables
+          year = now.year ();
+          month = now.month ();
+          day = now.day ();
+          hour = now.hour ();
+          minute = now.minute ();
+          second = now.second ();
+
+          // daylight savings? one hour later
+          if (digitalRead (DST) == LOW)
+            hour++;
+
+          // now check if we overflowed the hours
+          if (hour > 23)
+            {
+            hour = 0;
+            day++;
+            }
+
+          // is it a leap year?
+          byte daysinMonth [12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+          //                        JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC
+
+          // leap year check
+          if ((year & 3) == 0 && ((year % 25) != 0 || (year & 15) == 0))
+            daysinMonth [1]++;  // February
+
+          // see if days overflowed
+          if (day > daysinMonth [month - 1])
+            {
+            month++;
+            day = 1;
+            }
+
+          // and the month
+          if (month > 12)
+            {
+            year++;
+            month = 1;
+            }
+
+          ok = true;
+          break;
+          }
+       else
+         showError ("rtc Err4");
+      }
+    }  // end of trying to find the time
+
+  powerOffRTC ();
+  return ok;
+  }  // end of getTime
+
+void powerOnDisplay ()
+{
+  // LED display
+  pinMode (DISPLAY_LOAD, OUTPUT);
+  digitalWrite (DISPLAY_LOAD, HIGH);
+
+  bbSPI.begin ();
+
+  sendByte (MAX7219_REG_SCANLIMIT, 7);      // show 8 digits
+  sendByte (MAX7219_REG_DECODEMODE, 0);     // use bit patterns
+  sendByte (MAX7219_REG_DISPLAYTEST, 0);    // no display test
+  sendByte (MAX7219_REG_INTENSITY, 7);      // character intensity: range: 0 to 15
+  sendString ("");                          // clear display
+  sendByte (MAX7219_REG_SHUTDOWN, 1);       // not in shutdown mode (ie. start it up)
+
+}  // end of powerOnDisplay
+
+void powerOffDisplay ()
+  {
+  sendByte (MAX7219_REG_SHUTDOWN, 0);  // shutdown mode (ie. turn it off)
+  digitalWrite (DISPLAY_LOAD, LOW);    // save power on MAX7219 LOAD line
+  digitalWrite (DISPLAY_MOSI, LOW);    // save power on LED display MOSI line
+  digitalWrite (DISPLAY_SCK,  LOW);    // save power on  LED display SCK line
+  }  // end of powerOffDisplay
+
+void powerOnDHT ()
+  {
+  dht.begin();
+  }  // end of powerOnDHT
+
+void powerOffDHT ()
+  {
+  digitalWrite(DHTPIN, LOW);
+  }  // end of powerOffDHT
+
+// reference: http://wahiduddin.net/calc/density_algorithms.htm
+float dewPoint(float celsius, float humidity)
+{
+        float RATIO = 373.15 / (273.15 + celsius);  // RATIO was originally named A0, possibly confusing in Arduino context
+        float SUM = -7.90298 * (RATIO - 1);
+        SUM += 5.02808 * log10(RATIO);
+        SUM += -1.3816e-7 * (pow(10, (11.344 * (1 - 1/RATIO ))) - 1) ;
+        SUM += 8.1328e-3 * (pow(10, (-3.49149 * (RATIO - 1))) - 1) ;
+        SUM += log10(1013.246);
+        float VP = pow(10, SUM - 3) * humidity;
+        float T = log(VP/0.61078);   // temp var
+        return (241.88 * T) / (17.558 - T);
+}
+
+void getTemperatureAndHumdity ()
+  {
+  powerOnDHT ();
+  delay (2000);  // let device get ready
+  humidity    = dht.readHumidity();
+  temperature = dht.readTemperature();
+  powerOffDHT ();
+  if (isnan (humidity))
+    strcpy (humidityString, "NaN");
+  else
+    fmtDouble (humidity,    2, humidityString, sizeof humidityString);
+  if (isnan (temperature))
+    strcpy (temperature1String, "NaN");
+  else
+    fmtDouble (temperature, 2, temperature1String, sizeof temperature1String);
+  }  // end of getTemperatureAndHumdity
+
+void getThermistorTemperature ()
+  {
+  float average = 0.0;
+
+  // take N samples in a rowy
+  for (byte i = 0; i < THERMISTOR_SAMPLES; i++)
+     average += analogRead (THERMISTOR_PIN);
+
+  average /= THERMISTOR_SAMPLES;
+
+  // convert the value to resistance
+  average = 1023 / average - 1;
+  average = SERIESRESISTOR / average;
+
+  float steinhart = average / THERMISTORNOMINAL;
+  steinhart = log (steinhart);
+  steinhart /= BCOEFFICIENT;
+  steinhart += 1.0 / (TEMPERATURENOMINAL + KELVIN);
+  steinhart = 1.0 / steinhart;
+  steinhart -= KELVIN;   // back to celsius
+  fmtDouble (steinhart, 2, temperature2String, sizeof temperature2String);
+  }  // end of getThermistorTemperature
+
+void recordReading ()
+{
+  // one flash so we know it is taking a measurement
+  flashLED (1);
+
+  getTemperatureAndHumdity ();
+  getThermistorTemperature ();
+
+  analogRead (LDR_PIN);  // just in case
+  int light = 1023 - analogRead (LDR_PIN);
+
+  if (isnan (humidity))
+    {
+    showError ("dht H");
+    return;  // failed to read humidity
+    }
+
+  if (isnan (temperature))
+    {
+    showError ("dht t");
+    return;  // failed to read temperature
+    }
+
+// file system object
+SdFat sd;
+
+  // warn them not to unplug the SD card
+  flashLED (10);
+
+  // initialize the SD card at SPI_HALF_SPEED to avoid bus errors with
+  // breadboards.  use SPI_FULL_SPEED for better performance.
+  if (!sd.begin (SD_CHIP_SELECT, SPI_HALF_SPEED))
+    {
+    showError ("Sd Error");
+    return;  // failed to start
+    }
+
+// Log file.
+SdFile file;
+
+  SPI.begin ();
+
+  if (!file.open (fileName,  O_CREAT | O_WRITE | O_APPEND))
+    {
+    showError ("FILE");
+    return;  // failed to start
+    }
+
+  char buf [30];
+
+  // timestamp and readings
+  sprintf (buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          (int) year, (int) month, (int) day,
+          (int) hour, (int) minute, (int) second);
+
+  file.print (buf);
+  file.print ("\t");
+  file.print (humidityString);
+  file.print ("\t");
+  file.print (temperature1String);  // from DHT22
+  file.print ("\t");
+  file.print (temperature2String);  // from thermistor
+  file.print ("\t");
+  fmtDouble (dewPoint (temperature, humidity), 2, buf, sizeof buf);
+  file.print (buf);  // dew point
+  sprintf (buf, "\t%i", light);     // now the light level
+  file.print (buf);
+  file.println ();
+  writeCount++;
+
+  file.sync ();
+  file.close ();
+
+  delay (100);  // enough?
+
+  SPI.end ();
+
+  flashLED (2);
+
+}  // end of recordReading
+
+void wake ()
+{
+  // cancel sleep as a precaution
+  sleep_disable();
+  // must do this as the pin will probably stay low for a while
+  detachInterrupt (0);
+  // note button was pressed
+  buttonPressed = true;
+}  // end of wake
+
+//This function returns the date and time for SD card file access and modify time.
+void fileDateTime (uint16_t* date, uint16_t* time)
+  {
+  *date=FAT_DATE(year, month, day);
+  *time=FAT_TIME(hour, minute, second);
+  }  // end of fileDateTime
+
+void setup ()
+  {
+
+  powerOnPeripherals ();
+  powerOnDisplay ();
+  sendString ("HELL0");
+  delay (1000);
+  powerOffDisplay ();
+  powerOffPeripherals ();
+
+  // Attach callback function to provide date time to files.
+  SdFile::dateTimeCallback (fileDateTime);
+
+}  // end of setup
+
+void showTime ()
+  {
+  char buf [15];
+
+  powerOnDisplay ();
+
+  sprintf (buf, "dAtE%2d.%02d", (int) day, (int) month);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  sprintf (buf, "Hour%2d.%02d", (int) hour, (int) minute);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  powerOffDisplay ();
+  }  // end of showTime
+
+void showStuff ()
+  {
+  char buf [15];
+
+  powerOnPeripherals ();
+  getTime ();
+  showTime ();
+
+  powerOnDisplay ();
+  sendString ("rEAd . . . ");
+  getTemperatureAndHumdity ();
+
+  sprintf (buf, "t1 %s", temperature1String);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  getThermistorTemperature ();
+  sprintf (buf, "t2 %s", temperature2String);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  sprintf (buf, "H  %s", humidityString);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  strcpy (buf, "d  ");
+  fmtDouble (dewPoint (temperature, humidity), 2, &buf [3], (sizeof buf) - 3);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  int light = 1023 - analogRead (LDR_PIN);
+  sprintf (buf, "L  %i", light);
+  sendString (buf);
+  delay (TIME_TO_SHOW_READINGS);
+
+  if (errorCount > 99999)
+    sendString ("Err-LotS");
+  else
+    {
+    sprintf (buf, "Err%5ld", errorCount);
+    sendString (buf);
+    }
+  delay (TIME_TO_SHOW_READINGS);
+
+  if (writeCount > 99999)
+    sendString ("Out-Lots");
+  else
+    {
+    sprintf (buf, "Out%5ld", writeCount);
+    sendString (buf);
+    }
+  delay (TIME_TO_SHOW_READINGS);
+
+  powerOffDisplay ();
+
+  powerOffPeripherals ();
+  }
+
+int counter;
+
+void loop ()
+  {
+  // sleep for 8 seconds
+  myWatchdogEnable (WDT_8_SEC);
+
+  // did they push the switch?
+  if (buttonPressed)
+    showStuff ();
+
+  // count number of times we slept
+  counter++;
+
+  // every 48 seconds check the time (6 lots of 8 seconds asleep)
+  if (counter >= 6)
+    {
+
+    /*  DEBUGGING
+    Serial.begin (115200);
+    Serial.print ("Powering on at: ");
+    Serial.println (millis ());
+    */
+
+    powerOnPeripherals ();
+    getTime ();
+    if (now.minute () != lastMinute)
+      {
+      if ((now.minute () % TAKE_READINGS_EVERY) == 0)
+        recordReading ();
+      lastMinute = now.minute ();
+      }  // end of change in the minute
+
+    /*
+    Serial.print ("Powering off at: ");
+    Serial.println (millis ());
+    Serial.flush ();
+    Serial.end ();
+    */
+
+    powerOffPeripherals ();
+
+    counter = 0;
+    }  // end of sleeping for 6 times
+
+}  // end of loop
