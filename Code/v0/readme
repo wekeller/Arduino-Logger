@@ -1,0 +1,3 @@
+v0_0 = sensors working with proper power on, power off commands. Continuous sensors
+v0_01 = sensors working with proper power on, power off commands, and request for data commands. Interactive
+
