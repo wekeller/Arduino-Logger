@@ -4,7 +4,7 @@
  * to the µSD card every 20 characters, but to make sure everything is written
  * append 'EOF' to your writing. Doing so writes everything remaining in the
  * buffer to the file and reads back the contents of the file.
- * CD=8. DQ=12, SCK=13, DI=11, CS=8
+ * CD=9. DQ=12, SCK=13, DI=11, CS=8
  */
 
 #include <SPI.h>
