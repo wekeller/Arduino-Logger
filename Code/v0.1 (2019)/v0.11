@@ -62,33 +62,8 @@ void setup() {                      // startup function
   intro();          // display startup message
 }
 
-void powerOnPeripherals (){
-  // power MOSFET - initially off
-  digitalWrite (POWER, LOW);
-  pinMode      (POWER, OUTPUT);
-  }
-
-void powerOffPeripherals (){
-
-  // put all digital pins into low stats
-  for (byte pin = 0; pin < 14; pin++)
-    {
-    digitalWrite (pin, HIGH);  //SET TO HIGH FOR CODING!!! Change!!!
-    pinMode (pin, OUTPUT);
-    }
-
-  // except the power pin which has to be high
-  digitalWrite (POWER, HIGH);  // turn power OFF
-  // and activation switch
-  }  // end of powerOffPeripherals
-
-void serialEvent() {                          // This interrupt will trigger when the data coming from the serial monitor(pc/mac/other) is received
-  computer_bytes_received = Serial.readBytesUntil(13, computerdata, 20);  // We read the data sent from the serial monitor(pc/mac/other) until we see a <CR>. We also count how many characters have been received
-  computerdata[computer_bytes_received] = 0;                // We add a 0 to the spot in the array just after the last character we received.. This will stop us from transmitting incorrect data that may have been left in the buffer
-}
-
 ////////////////////////////////////////////////////////////////////////////////
-// Begin SD Card Section
+// SD Card Section
 ////////////////////////////////////////////////////////////////////////////////
 void initializeCard(void)
 {
@@ -199,46 +174,44 @@ void readByte(void)
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Begin Loop
-////////////////////////////////////////////////////////////////////////////////
-
-void loop() {                                   // main loop
-  powerOnPeripherals();
-  delay(2000);
-  if (computer_bytes_received != 0) {           // If computer_bytes_received does not equal zero
-    
-    channel = atoi(strtok(computerdata, ":"));  // Let's parse the string at each colon
-    cmd = strtok(NULL, ":");                    // Let's parse the string at each colon
-
-    I2C_call();                           // send to I2C
-
-    computer_bytes_received = 0;                // Reset the var computer_bytes_received to equal 0
-  }
-  Get_Temp();
-  powerOffPeripherals();
-  delay(15000);
-    if (!digitalRead(cardDetect))
-  {
-    initializeCard();
-  }
-
-  if (Serial.available() > 0)
-  {
-    readByte();
-
-    if (index == BUFFER_SIZE)
-    {
-      flushBuffer();  // Write full buffer to µSD card
-    }
-  }
-}
-
 void intro() {                                  // print intro
   Serial.flush();
   Serial.println(" ");
   Serial.println("Welcome to the YNP Sensor Prototype");
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Sensor Board commands
+////////////////////////////////////////////////////////////////////////////////
+void powerOnPeripherals (){
+  // power MOSFET - initially off
+  digitalWrite (POWER, LOW);
+  pinMode      (POWER, OUTPUT);
+  }
+
+void powerOffPeripherals (){
+
+  // put all digital pins into low stats
+  for (byte pin = 0; pin < 14; pin++)
+    {
+    digitalWrite (pin, HIGH);  //SET TO HIGH FOR CODING!!! Change!!!
+    pinMode (pin, OUTPUT);
+    }
+
+  // except the power pin which has to be high
+  digitalWrite (POWER, HIGH);  // turn power OFF
+  // and activation switch
+  }  // end of powerOffPeripherals
+
+void serialEvent() {                          // This interrupt will trigger when the data coming from the serial monitor(pc/mac/other) is received
+  computer_bytes_received = Serial.readBytesUntil(13, computerdata, 20);  // We read the data sent from the serial monitor(pc/mac/other) until we see a <CR>. We also count how many characters have been received
+  computerdata[computer_bytes_received] = 0;                // We add a 0 to the spot in the array just after the last character we received.. This will stop us from transmitting incorrect data that may have been left in the buffer
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// I2C Commands
+////////////////////////////////////////////////////////////////////////////////
 
 void I2C_call() {               // function to parse and call I2C commands
   sensor_bytes_received = 0;                    // reset data counter
@@ -363,4 +336,39 @@ void Get_EC() {               // function to parse and call I2C commands
   }
 
   Serial.println(ecdata);         // print the data.
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Loop
+////////////////////////////////////////////////////////////////////////////////
+
+void loop() {                                   // main loop
+  powerOnPeripherals();
+  delay(2000);
+  if (computer_bytes_received != 0) {           // If computer_bytes_received does not equal zero
+    
+    channel = atoi(strtok(computerdata, ":"));  // Let's parse the string at each colon
+    cmd = strtok(NULL, ":");                    // Let's parse the string at each colon
+
+    I2C_call();                           // send to I2C
+
+    computer_bytes_received = 0;                // Reset the var computer_bytes_received to equal 0
+  }
+  Get_Temp();
+  powerOffPeripherals();
+  delay(15000);
+    if (!digitalRead(cardDetect))
+  {
+    initializeCard();
+  }
+
+  if (Serial.available() > 0)
+  {
+    readByte();
+
+    if (index == BUFFER_SIZE)
+    {
+      flushBuffer();  // Write full buffer to µSD card
+    }
+  }
 }
