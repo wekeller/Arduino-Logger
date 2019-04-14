@@ -1,0 +1,518 @@
+
+// 102:r<CR>
+// 99:i<CR>
+// 100:c<CR>
+// 99:r<CR>
+// 110:cal,mid,7.00<CR>
+//
+#include <RTClib.h>
+#include <Wire.h>                   // enable I2C.
+#include <SPI.h>
+#include <SD.h>
+File myFile;  //for SD Card Write
+int val = 0;           // variable to store the value read
+int analogPin = 3;       //pin to power the sensor board panel
+
+const byte POWER = 3;
+const byte LED = 4;
+const byte SD_CHIP_SELECT = 8;     //configure SD card from here!!!!!
+const int TIME_TO_SHOW_READINGS = 3000;
+const int TAKE_READINGS_EVERY = 1;    // minutes
+const int BAUD = 9600;      //default baud rate
+const int temp_time = 1000;     //time to measure temperature
+const int ec_time = 3000;     //time to measure conductivity
+const int ph_time = 3000;     //time to measure pH
+const int i2c_time = 3000;    //time to power on i2c ch
+const uint8_t chipSelect = 8;     //SD chip select
+const uint8_t cardDetect = 9;     //SD card detect
+
+File fd;      //info for SD card
+RTC_DS3231 rtc;    //RTC
+const uint8_t BUFFER_SIZE = 20;
+char fileName[] = "demoFile.txt"; // SD library only supports up to 8.3 names
+char buff[BUFFER_SIZE+2] = "";  // Added two to allow a 2 char peek for EOF state
+uint8_t index = 0; 
+enum states: uint8_t { NORMAL, E, EO };
+uint8_t state = NORMAL;
+bool alreadyBegan = false;  // SD.begin() misbehaves if not first call
+
+unsigned long errorCount;
+unsigned long writeCount;
+unsigned long serial_host  = (BAUD);  // set baud rate for host serial monitor(pc/mac/other)
+
+char sensordata[30];                // A 30 byte character array to hold incoming data from the sensors
+char tempdata[30];
+char ecdata[30];
+char gettime[30];
+byte computer_bytes_received = 0;   // We need to know how many characters bytes have been received
+byte sensor_bytes_received = 0;     // We need to know how many characters bytes have been received
+byte second, minute, hour, dayOfWeek, dayOfMonth, month, year;
+int channel;                        // INT pointer for channel switching - 0-7 serial, 8-127 I2C addresses
+int clockAddress = 0x68;
+char *cmd;                          // Char pointer used in string parsing
+char t[32];                         // RTC char
+
+char computerdata[48];              // we make a 20 byte character array to hold incoming data from a pc/mac/other.
+byte code = 0;                      // used to hold the I2C response code.
+byte in_char = 0;                   // used as a 1 byte buffer to store in bound bytes from the I2C Circuit.
+byte bcdToDec(byte val)
+{
+  return ( (val/16*10) + (val%16) );
+}
+int time;                         // used to change the dynamic polling delay needed for I2C read operations.
+
+////////////////////////////////////////////////////////////////////////////////
+// Begin Code
+////////////////////////////////////////////////////////////////////////////////
+
+void setup() {                      // startup function
+  powerOnPeripherals ();  //fun power on of sensor board
+  Serial.begin(BAUD);              // Set the hardware serial port.
+  Wire.begin();         // enable I2C port.
+  pinMode(cardDetect, INPUT);   //Detect SD breakout
+  initializeCard();    //initialize SD breakout
+  intro();          // display startup message
+  rtc.begin();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// SD Card Section
+////////////////////////////////////////////////////////////////////////////////
+void initializeCard(void)
+{
+  Serial.print(F("Initializing SD card..."));
+
+  // Is there even a card?
+  if (!digitalRead(cardDetect))
+  {
+    Serial.println(F("No card detected. Waiting for card."));
+    while (!digitalRead(cardDetect));
+    delay(250); // 'Debounce insertion'
+  }
+  if (!SD.begin(chipSelect) && !alreadyBegan)  // begin uses half-speed...
+  {
+    Serial.println(F("Initialization failed!"));
+    initializeCard(); // Possible infinite retry loop is as valid as anything
+  }
+  else
+  {
+    alreadyBegan = true;
+  }
+  Serial.println(F("Initialization done."));
+
+  Serial.print(fileName);
+  if (SD.exists(fileName))
+  {
+    Serial.println(F(" exists."));
+  }
+  else
+  {
+    Serial.println(F(" doesn't exist. Creating."));
+  }
+
+  Serial.print("Opening file: ");
+  Serial.println(fileName);
+
+  Serial.println(F("Enter text to be written to file. 'EOF' will terminate writing."));
+}
+
+void eof(void)
+{
+  index -= 3; // Remove EOF from the end
+  flushBuffer();
+
+  // Re-open the file for reading:
+  fd = SD.open(fileName);
+  if (fd)
+  {
+    Serial.println("");
+    Serial.print(fileName);
+    Serial.println(":");
+
+    while (fd.available())
+    {
+      Serial.write(fd.read());
+    }
+  }
+  else
+  {
+    Serial.print("Error opening ");
+    Serial.println(fileName);
+  }
+  fd.close();
+}
+
+void flushBuffer(void)
+{
+  fd = SD.open(fileName, FILE_WRITE);
+  if (fd) {
+    switch (state)  // If a flush occurs in the 'E' or the 'EO' state, read more to detect EOF
+    {
+    case NORMAL:
+      break;
+    case E:
+      readByte();
+      readByte();
+      break;
+    case EO:
+      readByte();
+      break;
+    }
+    fd.write(buff, index);
+    fd.flush();
+    index = 0;
+    fd.close();
+  }
+}
+
+void readByte(void)
+{
+  byte byteRead = Serial.read();
+  Serial.write(byteRead); // Echo
+  buff[index++] = byteRead;
+
+  // Must be 'EOF' to not get confused with words such as 'takeoff' or 'writeoff'
+  if (byteRead == 'E' && state == NORMAL)
+  {
+    state = E;
+  }
+  else if (byteRead == 'O' && state == E)
+  {
+    state = EO;
+  }
+  else if (byteRead == 'F' && state == EO)
+  {
+    eof();
+    state = NORMAL;
+  }
+}
+
+void inUseCardRemoval(void)
+{
+  // Is there even a card?
+  if (!digitalRead(cardDetect))
+  {
+    cardReboot();
+  }
+  else
+  {
+    alreadyBegan = true;
+    
+  }
+}
+
+void cardReboot()
+{
+  Serial.print(F("Waiting for new SD card..."));
+
+  // Is there even a card?
+  if (!digitalRead(cardDetect))
+  {
+    Serial.println(F("No card detected. Waiting for card."));
+    while (!digitalRead(cardDetect));
+    delay(250); // 'Debounce insertion'
+  }
+  if (!SD.begin(chipSelect) && !alreadyBegan)  // begin uses half-speed...
+  {
+    Serial.println(F("Initialization failed!"));
+    initializeCard(); // Possible infinite retry loop is as valid as anything
+  }
+  else
+  {
+    alreadyBegan = true;
+  }
+  Serial.println(F("Initialization done."));
+
+  Serial.print(fileName);
+  if (SD.exists(fileName))
+  {
+    Serial.println(F(" exists."));
+  }
+  else
+  {
+    Serial.println(F(" doesn't exist. Creating."));
+  }
+
+  Serial.print("Opening file: ");
+  Serial.println(fileName);
+
+  Serial.println(F("Enter text to be written to file. 'EOF' will terminate writing."));
+}
+
+void intro() {                                  // print intro
+  Serial.flush();
+  Serial.println(" ");
+  Serial.println("Welcome to the YNP Sensor Prototype");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Sensor Board commands
+////////////////////////////////////////////////////////////////////////////////
+void powerOnPeripherals (){
+  // power MOSFET - initially off
+  digitalWrite (POWER, LOW);
+  pinMode      (POWER, OUTPUT);
+  }
+
+void powerOffPeripherals (){
+
+  // put all digital pins into low stats
+  for (byte pin = 0; pin < 14; pin++)
+    {
+    digitalWrite (pin, HIGH);  //SET TO HIGH FOR CODING!!! Change!!!
+    pinMode (pin, OUTPUT);
+    }
+
+  // except the power pin which has to be high
+  digitalWrite (POWER, HIGH);  // turn power OFF
+  // and activation switch
+  }  // end of powerOffPeripherals
+
+void serialEvent() {                          // This interrupt will trigger when the data coming from the serial monitor(pc/mac/other) is received
+  computer_bytes_received = Serial.readBytesUntil(13, computerdata, 20);  // We read the data sent from the serial monitor(pc/mac/other) until we see a <CR>. We also count how many characters have been received
+  computerdata[computer_bytes_received] = 0;                // We add a 0 to the spot in the array just after the last character we received.. This will stop us from transmitting incorrect data that may have been left in the buffer
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// I2C Commands
+////////////////////////////////////////////////////////////////////////////////
+
+void I2C_call() {               // function to parse and call I2C commands
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(sensordata, 0, sizeof(sensordata));    // clear sensordata array;
+
+  if (cmd[0] == 'c' || cmd[0] == 'r');
+  else time = 300;                              //if a command has been sent to calibrate or take a reading we
+  //wait 3000ms so that the circuit has time to take the reading.
+  //if any other command has been sent we wait only 300ms.
+  
+  Wire.beginTransmission(channel);  // call the circuit by its ID number.
+  Wire.write(cmd);            // transmit the command that was sent through the serial port.
+  Wire.endTransmission();           // end the I2C data transmission.
+
+  delay(i2c_time);
+
+  code = 254;       // init code value
+
+  while (code == 254) {                 // in case the cammand takes longer to process, we keep looping here until we get a success or an error
+
+    Wire.requestFrom(channel, 48, 1);   // call the circuit and request 48 bytes (this is more then we need).
+    code = Wire.read();
+
+    while (Wire.available()) {          // are there bytes to receive.
+      in_char = Wire.read();            // receive a byte.
+
+      if (in_char == 0) {               // if we see that we have been sent a null command.
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop.
+      }
+      else {
+        sensordata[sensor_bytes_received] = in_char;  // load this byte into our array.
+        sensor_bytes_received++;
+      }
+    }
+
+
+    switch (code) {                   // switch case based on what the response code is.
+      case 1:                         // decimal 1.
+        Serial.println("Success");    // means the command was successful.
+        break;                          // exits the switch case.
+
+      case 2:                         // decimal 2.
+        Serial.println("< command failed");     // means the command has failed.
+        break;                          // exits the switch case.
+
+      case 254:                       // decimal 254.
+        Serial.println("< command pending");    // means the command has not yet been finished calculating.
+        delay(200);                     // we wait for 200ms and give the circuit some time to complete the command
+        break;                          // exits the switch case.
+
+      case 255:                       // decimal 255.
+        Serial.println("No Data");    // means there is no further data to send.
+        break;                          // exits the switch case.
+    }
+
+  }
+
+  Serial.println(sensordata);         // print the data.
+}
+
+void Get_Temp() {               // function to parse and call I2C commands
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(tempdata, 0, sizeof(tempdata));    // clear sensordata array; 
+  Wire.beginTransmission(102);  // call the circuit by its ID number.
+  Wire.write("r");            // transmit the command that was sent through the serial port.
+  Wire.endTransmission();           // end the I2C data transmission.
+
+  delay(temp_time);
+
+  code = 254;       // init code value
+
+  while (code == 254) {                 // in case the command takes longer to process, we keep looping here until we get a success or an error
+
+    Wire.requestFrom(102, 48, 1);   // call the circuit and request 48 bytes (this is more then we need).
+    code = Wire.read();
+
+    while (Wire.available()) {          // are there bytes to receive.
+      in_char = Wire.read();            // receive a byte.
+
+      if (in_char == 0) {               // if we see that we have been sent a null command.
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop.
+      }
+      else {
+        tempdata[sensor_bytes_received] = in_char;  // load this byte into our array.
+        sensor_bytes_received++;
+      }
+    }
+  }
+
+  Serial.print(tempdata);         // print the data.
+  Serial.print(" C");
+}
+
+void Get_EC() {               // function to parse and call I2C commands      
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(ecdata, 0, sizeof(ecdata));    // clear sensordata array; 
+  Wire.beginTransmission(100);  // call the circuit by its ID number.
+  Wire.write("r");            // transmit the command that was sent through the serial port.
+  Wire.endTransmission();           // end the I2C data transmission.
+  delay(ec_time);       //time to measure conductivity
+
+  code = 254;       // init code value
+
+  while (code == 254) {                 // in case the command takes longer to process, we keep looping here until we get a success or an error
+
+    Wire.requestFrom(100, 48, 1);   // call the circuit and request 48 bytes (this is more then we need).
+    code = Wire.read();
+
+    while (Wire.available()) {          // are there bytes to receive.
+      in_char = Wire.read();            // receive a byte.
+
+      if (in_char == 0) {               // if we see that we have been sent a null command.
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop.
+      }
+      else {
+        ecdata[sensor_bytes_received] = in_char;  // load this byte into our array.
+        sensor_bytes_received++;
+      }
+    }
+  }
+
+  Serial.println(ecdata);         // print the data.
+}
+
+void Get_Time() {               // function to parse and call I2C commands      
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(gettime, 0, sizeof(gettime));    // clear sensordata array; 
+  Wire.beginTransmission(clockAddress);  // call the circuit by its ID number.
+  Wire.write(byte(0x00));
+  Wire.endTransmission();
+
+  Wire.requestFrom(clockAddress, 7);
+  // A few of these need masks because certain bits are control bits
+  second     = bcdToDec(Wire.read() & 0x7f);
+  minute     = bcdToDec(Wire.read());
+  
+  // Need to change this if 12 hour am/pm
+  hour       = bcdToDec(Wire.read() & 0x3f);  
+  dayOfWeek  = bcdToDec(Wire.read());
+  dayOfMonth = bcdToDec(Wire.read());
+  month      = bcdToDec(Wire.read());
+  year       = bcdToDec(Wire.read());
+    
+    if(hour<10)
+  Serial.print('0');
+  Serial.print(hour, DEC);
+  Serial.print(":");
+    if(minute<10)
+  Serial.print('0');
+  Serial.print(minute, DEC);
+  Serial.print(":");
+    if(second<10)
+  Serial.print('0');
+  Serial.print(second, DEC);
+  Serial.print(",");
+  Serial.print("  ");
+   if(month<10)
+  Serial.print('0');
+  Serial.print(month, DEC);
+  Serial.print("/");
+    if(dayOfMonth<10)
+  Serial.print('0');
+  Serial.print(dayOfMonth, DEC);
+  Serial.print("/");
+  Serial.print(year, DEC);
+
+  Wire.endTransmission();
+
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Loop
+////////////////////////////////////////////////////////////////////////////////
+
+void loop() {                                   // main loop
+  powerOnPeripherals();
+  delay(2000);
+  inUseCardRemoval();
+  if (computer_bytes_received != 0) {           // If computer_bytes_received does not equal zero
+    
+    channel = atoi(strtok(computerdata, ":"));  // Let's parse the string at each colon
+    cmd = strtok(NULL, ":");                    // Let's parse the string at each colon
+
+    I2C_call();                           // send to I2C
+
+    computer_bytes_received = 0;                // Reset the var computer_bytes_received to equal 0
+  }
+  Get_Time();
+  Serial.print(",  ");
+  Get_Temp();
+  Serial.print('\n');
+
+myFile = SD.open(fileName, FILE_WRITE);
+  if (myFile) {  
+     if(hour<10)
+      myFile.print(0);
+    myFile.print(hour, DEC);
+    myFile.print(":");
+     if(minute<10)
+      myFile.print(0);
+    myFile.print(minute, DEC);
+    myFile.print(":");
+      if(second<10)
+       myFile.print(0);
+    myFile.print(second, DEC);
+    myFile.print(", ");
+    myFile.print("20");
+    myFile.print(year, DEC);
+    myFile.print("_");
+     if(month<10)
+      myFile.print(0);
+    myFile.print(month, DEC);
+    myFile.print("_");
+     if(dayOfMonth<10)
+      myFile.print(0);
+    myFile.print(dayOfMonth, DEC);
+    myFile.print(", ");
+    myFile.println(tempdata);
+    myFile.close(); // close the file
+  }
+   //if the file didnt open, print an error:
+  else {
+    Serial.print("error opening ");
+    Serial.print((fileName));
+    Serial.print('\n');
+  }
+
+  //powerOffPeripherals();
+  //delay(3000);
+
+
+}
+
+
+
