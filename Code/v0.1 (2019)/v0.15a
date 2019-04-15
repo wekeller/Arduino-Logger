@@ -1,0 +1,262 @@
+#include <SPI.h>
+#include "SdFat.h"
+#include <Wire.h>
+#include <RTClib.h>
+
+//------------------------------------------------------------------------------
+// File system object.
+SdFat sd;  
+SdFile file;  //Log file
+RTC_DS3231 rtc;    //RTC
+uint32_t logTime;  // Time in micros for next data record.
+const uint8_t chipSelect = SS;
+const uint8_t cardDetect = 8;     //SD card detect
+#define FILE_BASE_NAME "123456"
+#define error(msg) sd.errorHalt(F(msg))
+const uint32_t SAMPLE_INTERVAL_MS = 1000;
+const uint8_t BASE_NAME_SIZE = sizeof(FILE_BASE_NAME) - 1;
+const uint8_t ANALOG_COUNT = 4;
+const int BAUD = 9600;      //default baud rate
+const int temp_time = 1000;     //time to measure temperature
+const byte POWER = 3;
+byte second, minute, hour, dayOfWeek, dayOfMonth, month, year;
+byte sensor_bytes_received = 0;     // We need to know how many characters bytes have been received
+byte bcdToDec(byte val){return ( (val/16*10) + (val%16) );}
+byte code = 0;                      // used to hold the I2C response code.
+byte in_char = 0;                   // used as a 1 byte buffer to store in bound bytes from the I2C Circuit.
+int clockAddress = 0x68;            // I2C address of clock
+char fileName[13] = FILE_BASE_NAME "00.csv";  //make this a string
+char gettime[30];
+char dateStr[8];    
+char timeStr[9];
+char tempdata[30];
+bool alreadyBegan = false;  // SD.begin() misbehaves if not first call
+//characters in gettime
+//==============================================================================
+// Functions
+//==============================================================================
+void intro() {                                  // print intro
+  Serial.flush();
+  Serial.println(" ");
+  Serial.println("Welcome to the YNP Sensor Prototype");
+}
+//------------------------------------------------------------------------------
+
+void writeHeader() {
+  file.print(F("date"));
+  file.print(F(",time"));
+  file.print(F(",temperature"));
+  file.println();
+}
+//------------------------------------------------------------------------------
+
+void logData() {
+  file.print(dateStr);
+  file.write(',');
+  file.print(timeStr);
+  file.print(',');
+  file.println("2");
+}
+//------------------------------------------------------------------------------
+
+void initializeCard() {
+  if (!digitalRead(cardDetect))
+  {
+    Serial.println(F("No card detected. Waiting for card."));
+    while (!digitalRead(cardDetect));
+    delay(250); // 'Debounce insertion'
+  }
+  // Initialize at the highest speed supported by the board that is
+  // not over 50 MHz. Try a lower speed if SPI errors occur.
+  if (!sd.begin(10, SD_SCK_MHZ(50))) {
+    sd.initErrorHalt();
+  }
+
+  // Find an unused file name.
+  if (BASE_NAME_SIZE > 6) {
+    error("FILE_BASE_NAME too long");
+  }
+  while (sd.exists(fileName)) {
+    if (fileName[BASE_NAME_SIZE + 1] != '9') {
+      fileName[BASE_NAME_SIZE + 1]++;
+    } else if (fileName[BASE_NAME_SIZE] != '9') {
+      fileName[BASE_NAME_SIZE + 1] = '0';
+      fileName[BASE_NAME_SIZE]++;
+    } else {
+      error("Can't create file name");
+    }
+  }
+  if (!file.open(fileName, O_WRONLY | O_CREAT | O_EXCL)) {
+    error("file.open");
+  }
+  // Read any Serial data.
+  do {
+    delay(10);
+  } while (Serial.available() && Serial.read() >= 0);
+
+  Serial.print(F("Logging to: "));
+  Serial.println(fileName);
+  Serial.println(F("Type any character to stop"));
+ }
+//------------------------------------------------------------------------------
+
+ void inUseCardRemoval(void)
+{
+  // Is there even a card?
+  if (!digitalRead(cardDetect))
+  {
+    initializeCard();
+  }
+  else
+  {
+    alreadyBegan = true;
+    
+  }
+}
+//------------------------------------------------------------------------------
+
+void forceData() {
+  if (!file.sync() || file.getWriteError()) {
+    error("write error");
+  }
+}
+//------------------------------------------------------------------------------
+
+void waitLog() {
+int32_t diff;
+  do {
+    diff = micros() - logTime;
+  } while (diff < 0);
+
+  // Check for data rate too high.
+  if (diff > 10) {
+    error("Missed data record");
+  }
+}
+//------------------------------------------------------------------------------
+
+void powerOnPeripherals (){
+  // power MOSFET - initially off
+  digitalWrite (POWER, LOW);
+  pinMode      (POWER, OUTPUT);
+  }
+//------------------------------------------------------------------------------
+
+void setLogTime () {
+  // Start on a multiple of the sample interval.
+  logTime = micros()/(1000UL*SAMPLE_INTERVAL_MS) + 1;
+  logTime *= 1000UL*SAMPLE_INTERVAL_MS;
+}
+//------------------------------------------------------------------------------
+
+void Get_Time() {                               // function to parse and call I2C commands      
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(gettime, 0, sizeof(gettime));          // clear sensordata array; 
+  Wire.beginTransmission(clockAddress);         // call the circuit by its ID number.
+  Wire.write(byte(0x00));
+  Wire.endTransmission();
+
+  Wire.requestFrom(clockAddress, 7);
+  // A few of these need masks because certain bits are control bits
+  second     = bcdToDec(Wire.read() & 0x7f);
+  minute     = bcdToDec(Wire.read());
+  
+  // Need to change this if 12 hour am/pm
+  hour       = bcdToDec(Wire.read() & 0x3f);  
+  dayOfWeek  = bcdToDec(Wire.read());
+  dayOfMonth = bcdToDec(Wire.read());
+  month      = bcdToDec(Wire.read());
+  year       = bcdToDec(Wire.read());
+  Wire.endTransmission();
+}
+//------------------------------------------------------------------------------
+
+void dateString () {
+  sprintf (dateStr, "20%02d%02d%02d",
+    year, month, dayOfMonth);
+    Serial.println(dateStr);
+}
+//------------------------------------------------------------------------------
+
+void timeString () {
+  sprintf (timeStr, "%02d:%02d:%02d",
+    hour, minute, second);
+    Serial.println(timeStr);
+}
+//------------------------------------------------------------------------------
+
+void Get_Temp() {               // function to parse and call I2C commands
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(tempdata, 0, sizeof(tempdata));    // clear sensordata array; 
+  Wire.beginTransmission(102);  // call the circuit by its ID number.
+  Wire.write("r");            // transmit the command that was sent through the serial port.
+  Wire.endTransmission();           // end the I2C data transmission.
+
+  delay(temp_time);
+
+  code = 254;       // init code value
+
+  while (code == 254) {                 // in case the command takes longer to process, we keep looping here until we get a success or an error
+
+    Wire.requestFrom(102, 48, 1);   // call the circuit and request 48 bytes (this is more then we need).
+    code = Wire.read();
+
+    while (Wire.available()) {          // are there bytes to receive.
+      in_char = Wire.read();            // receive a byte.
+
+      if (in_char == 0) {               // if we see that we have been sent a null command.
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop.
+      }
+      else {
+        tempdata[sensor_bytes_received] = in_char;  // load this byte into our array.
+        sensor_bytes_received++;
+      }
+    }
+  }
+
+  Serial.print(tempdata);         // print the data.
+  Serial.println(" C");
+}
+//------------------------------------------------------------------------------
+
+
+//==============================================================================
+// Setup
+//==============================================================================
+void setup() {
+  powerOnPeripherals ();    //powers board through MOSFET
+  Serial.begin(BAUD);       //set BAUD rate
+  delay(1000);              //give sensors time to boot.
+  //detect card
+  initializeCard();
+  writeHeader();
+  setLogTime ();
+  Wire.begin(); 
+  rtc.begin();
+  intro();
+
+
+}
+//==============================================================================
+// Loop
+//==============================================================================
+void loop() {
+  // Time for next record.
+  logTime += 1000UL*SAMPLE_INTERVAL_MS;
+  //waitLog();
+  //Get_Temp();
+  Get_Time();
+  dateString ();
+  timeString ();
+  logData();              //add close document after, and open document. might be covered under serial available
+  forceData();
+  delay(2000);
+
+  if (Serial.available()) {
+    // Close file and stop.
+    file.close();
+    Serial.println(F("Done"));
+    SysCall::halt();
+  }
+}
