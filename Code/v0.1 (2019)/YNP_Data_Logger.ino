@@ -1,0 +1,317 @@
+#include <SPI.h>             // SD interface/communication? 
+#include <Wire.h>            // I2C library
+#include <RTClib.h>          // real-time clock
+#include <MemoryFree.h>      // monitor memory while programming
+#include "LowPower.h"		 // Low Power module from Rocket Scream
+#include "SdFat.h"           // SD Fat32 library
+
+//------------------------------------------------------------------------------
+// File system object.
+//------------------------------------------------------------------------------
+#define FILE_BASE_NAME "123456"
+#define error(msg) sd.errorHalt(F(msg))
+
+//------------------------------------------------------------------------------
+// Objects
+//------------------------------------------------------------------------------
+SdFat sd;                           //SDFat object
+SdFile file;                        //Log file
+RTC_DS3231 rtc;                     //RTC object
+
+//------------------------------------------------------------------------------
+// User Defined constants
+//------------------------------------------------------------------------------
+#define serial "987654321"          // SN of logger. These will probaby be shorter
+#define feature "Atomizer"          // Feature names sometimes include spaces. We need to make spaces underscores
+int interval = 5000;                // User-defined logging interval. Will range from 5 sec to 15 min depending on the feature
+
+//------------------------------------------------------------------------------
+// Additional Constants
+//------------------------------------------------------------------------------
+const uint8_t chipSelect = SS;
+const uint8_t cardDetect = 8;       //SD card detect
+const uint32_t SAMPLE_INTERVAL_MS = 1000;
+const uint8_t BASE_NAME_SIZE = sizeof(FILE_BASE_NAME) - 1;
+const uint8_t ANALOG_COUNT = 4;
+const int BAUD = 9600;              //default baud rate
+const int temp_time = 600;         //time to measure temperature. Look into how long it actually takes, but I think 1 sec is close to min
+const byte POWER = 3;               // Power pin to turn on sensor board
+
+//------------------------------------------------------------------------------
+// Variables
+//------------------------------------------------------------------------------
+uint32_t logTime;                   // Time in micros for next data record.
+byte second, minute, hour, dayOfWeek, dayOfMonth, month, year;
+byte sensor_bytes_received = 0;     // We need to know how many characters bytes have been received
+byte bcdToDec(byte val){return ( (val/16*10) + (val%16) );}
+byte code = 0;                      // used to hold the I2C response code.
+byte in_char = 0;                   // used as a 1 byte buffer to store in bound bytes from the I2C Circuit.
+int clockAddress = 0x68;            // I2C address of clock
+char fileName[13] = FILE_BASE_NAME "00.csv";  //MAKE THIS TAKE LOGGERFILENAME.csv!!!!!!! Will need to increase number of characters
+char getTime[30];                   // number of characters in getTime call from RTC
+char dateStr[8];                    // number of characters in dateStr (yyyymmdd)
+char timeStr[8];                    // number of characters in timeStr (hh:mm:ss)
+char tempData[30];                  // number of characters in tempData. Maybe bring this down if string space becomes an issue
+char loggerFileName[100];           // number of characters in logger file name (yyyymmdd_feature_serial)
+bool alreadyBegan = false;          // SD.begin() misbehaves if not first call
+
+//==============================================================================
+// Functions
+//==============================================================================
+void intro() {                                  // print intro
+  Serial.flush();                   // flush any serial info that may exist
+  Serial.println(" ");
+  Serial.println("Welcome to the YNP Sensor Prototype");
+}
+//------------------------------------------------------------------------------
+
+void loggerName() {
+  sprintf(loggerFileName, "20%d%d%d_%s_%s.csv", year, month, dayOfMonth, feature, serial);  //yyyymmdd_feature_serial.csv
+}
+//------------------------------------------------------------------------------
+
+void writeHeader() {                // we need to figure out how to enable additional sensors with a GUI
+  file.print(F("date"));            // date header
+  file.print(F(",time"));           // time of day header
+  file.print(F(",temperature"));    // temperature measurement
+  file.println();                   // brings cursor down for immediate data entry
+}
+//------------------------------------------------------------------------------
+
+void logData() {                    // data logging loop
+  file.open((fileName), FILE_WRITE);    // open existing filename cached and begin writting
+  file.print(dateStr);              // write date
+  file.write(',');                 
+  file.print(timeStr);              // write time
+  file.print(',');
+  file.println(tempData);           // write temp
+  delay (200);                      // supposed to give a 200ms delay before closing
+  file.close();                     // close file after writing. do we need to flush? 
+}
+//------------------------------------------------------------------------------
+
+void initializeCard() {
+  if (!digitalRead(cardDetect))
+  {
+    Serial.println(F("No card detected. Waiting for card."));
+    while (!digitalRead(cardDetect));
+    delay(250); // 'Debounce insertion'
+  }
+  // Initialize at the highest speed supported by the board that is
+  // not over 50 MHz. Try a lower speed if SPI errors occur.
+  if (!sd.begin(10, SD_SCK_MHZ(50))) {
+    sd.initErrorHalt();
+  }
+
+  // Find an unused file name.
+  if (BASE_NAME_SIZE > 6) {
+    error("FILE_BASE_NAME too long");
+  }
+  while (sd.exists(fileName)) {
+    if (fileName[BASE_NAME_SIZE + 1] != '9') {
+      fileName[BASE_NAME_SIZE + 1]++;
+    } else if (fileName[BASE_NAME_SIZE] != '9') {
+      fileName[BASE_NAME_SIZE + 1] = '0';
+      fileName[BASE_NAME_SIZE]++;
+    } else {
+      error("Can't create file name");
+    }
+  }
+  if (!file.open(fileName, O_WRONLY | O_CREAT | O_EXCL)) {
+    error("file.open");
+  }
+  // Read any Serial data.
+  do {
+    delay(10);
+  } while (Serial.available() && Serial.read() >= 0);
+  writeHeader();
+  Serial.print(F("Logging to: "));
+  Serial.println(fileName);
+  Serial.println(F("Type any character to stop"));
+ }
+//------------------------------------------------------------------------------
+
+ void inUseCardRemoval()
+{
+  // Is there even a card?
+  if (!digitalRead(cardDetect))
+  {
+    initializeCard();
+  }
+  else
+  {
+    alreadyBegan = true;
+    
+  }
+}
+//------------------------------------------------------------------------------
+
+void forceData() {
+  if (!file.sync() || file.getWriteError()) {
+    error("write error");
+  }
+}
+//------------------------------------------------------------------------------
+
+void waitLog() {
+int32_t diff;
+  do {
+    diff = micros() - logTime;
+  } while (diff < 0);
+
+  // Check for data rate too high.
+  if (diff > 10) {
+    error("Missed data record");
+  }
+}
+//------------------------------------------------------------------------------
+
+void powerOnPeripherals (){
+  // power MOSFET - initially off
+  digitalWrite (POWER, LOW);
+  pinMode      (POWER, OUTPUT);
+  }
+//------------------------------------------------------------------------------
+
+void powerOffPeripherals (){
+
+  // put all digital pins into low stats
+  for (byte pin = 0; pin < 14; pin++)
+    {
+    digitalWrite (POWER, HIGH);  //SET TO HIGH FOR CODING!!! Change!!!
+    pinMode (POWER, OUTPUT);
+    }
+}
+//------------------------------------------------------------------------------
+
+void setLogTime () {
+  // Start on a multiple of the sample interval.
+  logTime = micros()/(1000UL*SAMPLE_INTERVAL_MS) + 1;
+  logTime *= 1000UL*SAMPLE_INTERVAL_MS;
+}
+//------------------------------------------------------------------------------
+
+void Get_Time() {                               // function to parse and call I2C commands      
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(getTime, 0, sizeof(getTime));          // clear sensordata array; 
+  Wire.beginTransmission(clockAddress);         // call the circuit by its ID number.
+  Wire.write(byte(0x00));
+  Wire.endTransmission();
+
+  Wire.requestFrom(clockAddress, 7);
+  // A few of these need masks because certain bits are control bits
+  second     = bcdToDec(Wire.read() & 0x7f);
+  minute     = bcdToDec(Wire.read());
+  
+  // Need to change this if 12 hour am/pm
+  hour       = bcdToDec(Wire.read() & 0x3f);  
+  dayOfWeek  = bcdToDec(Wire.read());
+  dayOfMonth = bcdToDec(Wire.read());
+  month      = bcdToDec(Wire.read());
+  year       = bcdToDec(Wire.read());
+  Wire.endTransmission();
+}
+//------------------------------------------------------------------------------
+
+void dateString () {
+  sprintf (dateStr, "20%02d%02d%02d",
+    year, month, dayOfMonth);
+    //Serial.println(dateStr);
+}
+//------------------------------------------------------------------------------
+
+void timeString () {
+  sprintf (timeStr, "%02d:%02d:%02d",
+    hour, minute, second);
+    //Serial.println(timeStr);
+}
+//------------------------------------------------------------------------------
+
+void Get_Temp() {               // function to parse and call I2C commands
+  sensor_bytes_received = 0;                    // reset data counter
+  memset(tempData, 0, sizeof(tempData));    // clear sensordata array; 
+  Wire.beginTransmission(102);  // call the circuit by its ID number.
+  Wire.write("r");            // transmit the command that was sent through the serial port.
+  Wire.endTransmission();           // end the I2C data transmission.
+
+  delay(temp_time);
+
+  code = 254;       // init code value
+
+  while (code == 254) {                 // in case the command takes longer to process, we keep looping here until we get a success or an error
+
+    Wire.requestFrom(102, 48, 1);   // call the circuit and request 48 bytes (this is more then we need).
+    code = Wire.read();
+
+    while (Wire.available()) {          // are there bytes to receive.
+      in_char = Wire.read();            // receive a byte.
+
+      if (in_char == 0) {               // if we see that we have been sent a null command.
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop.
+      }
+      else {
+        tempData[sensor_bytes_received] = in_char;  // load this byte into our array.
+        sensor_bytes_received++;
+      }
+    }
+  }
+
+  Serial.print(tempData);         // print the data.
+  Serial.println(" C");
+}
+//------------------------------------------------------------------------------
+
+void sysCallHalt() {
+    if (Serial.available()) {
+    // Close file and stop.
+    file.close();
+    Serial.println(F("Done"));
+    SysCall::halt();
+  }
+}
+//------------------------------------------------------------------------------
+
+void viewSysMemory () {
+  Serial.print("freeMemory()=");
+  Serial.println(freeMemory());
+}
+
+//==============================================================================
+// Setup
+//==============================================================================
+void setup() {
+  powerOnPeripherals ();    // powers board through MOSFET
+  Serial.begin(BAUD);       // set BAUD rate
+  delay(1000);              // give sensors time to boot.
+  initializeCard();         // start sd card. upon reinsertion of sd card it will create a new file even if one exists
+  setLogTime ();            // I'm not 100% sure how this works or what it ties into. Look into this
+  Wire.begin();             // Start I2C communication (RTC and sensors)
+  rtc.begin();              // Start Real-Time Clock
+  Get_Time();               // Grab a time from the RTC. Will likely be wrong the first pull, so we pull it twice
+  delay(200);               // Give the RTC a sec to send a new signal
+  Get_Time();               // This time is almost never correct on the first call, so by calling it here the first reading will be correct in the loop
+  loggerName();             // Needs to be run after correct time has been called since the name is based on the format yyyymmdd_feature_serial
+  intro();                  // Run intro script (Welcome to YNP Sensor Prototype)
+}
+
+//==============================================================================
+// Loop
+//==============================================================================
+void loop() {
+  // Time for next record.
+  logTime += 1000UL*SAMPLE_INTERVAL_MS;   // again, LOOK INTO THIS
+  //waitLog();              // If this is run while I2C is running it pops an error. Not sure why. 
+  powerOnPeripherals ();    // Power on sensor board (and RTC/SD) SD not currently being powered down with board. Where should we put it? 
+  delay(800);              // This delay should cover the reat time for the temp probe
+  Get_Temp();               // Get temperature from sensor
+  Get_Time();               // Get time string from RTC 
+  dateString ();            // Pull date from the get_time string. Can we move this into logData?
+  timeString ();            // Pull time from the get_time string. Can we move this into logData? 
+  inUseCardRemoval();       // Check to see if there is a card present. If not hold operations
+  logData();                // Write the data to the SD
+  forceData();              // Not sure? 
+  //viewSysMemory ();       //check system memory while programming 
+  powerOffPeripherals ();   // Power off sensor board
+  delay(interval);          // Delay for the user-specified interval
+}
