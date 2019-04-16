@@ -23,7 +23,6 @@ RTC_DS3231 rtc;                     //RTC object
 //------------------------------------------------------------------------------
 #define serial "987654321"          // SN of logger. These will probaby be shorter
 #define feature "Atomizer"          // Feature names sometimes include spaces. We need to make spaces underscores
-int interval = 5000;                // User-defined logging interval. Will range from 5 sec to 15 min depending on the feature
 
 //------------------------------------------------------------------------------
 // Additional Constants
@@ -36,6 +35,21 @@ const uint8_t ANALOG_COUNT = 4;
 const int BAUD = 9600;              //default baud rate
 const int temp_time = 600;         //time to measure temperature. Look into how long it actually takes, but I think 1 sec is close to min
 const byte POWER = 3;               // Power pin to turn on sensor board
+
+// REVISION NEEDED!
+// Neeed to be able to have things in 5S intervals rather than predefined amounts
+
+
+const uint8_t SLEEP_TIME = 10; // Sleep time in seconds
+// Our options are limited to the ones listed here. The watchdog timer
+// Is only capable of sleeping for up to 8 seconds.
+const char SLEEP_TIME_DIVIDER = // SLEEP_1S; // 1 second wake up time
+								SLEEP_2S; // 2 second wake up time
+								// SLEEP_4S; // 4 second wake up time
+								// SLEEP_8S; // 8 second wake up time
+
+// This determines the humber of wake up cycles between readings.
+const uint8_t WAKE_UP_TIMER = (SLEEP_TIME / 2) - 1; // This is to be fixed in the future
 
 //------------------------------------------------------------------------------
 // Variables
@@ -54,6 +68,11 @@ char timeStr[8];                    // number of characters in timeStr (hh:mm:ss
 char tempData[30];                  // number of characters in tempData. Maybe bring this down if string space becomes an issue
 char loggerFileName[100];           // number of characters in logger file name (yyyymmdd_feature_serial)
 bool alreadyBegan = false;          // SD.begin() misbehaves if not first call
+
+// This tracks what cycle the wake up period is on. E.G. if we want to wait 10 
+// seconds between readings but wake up every 2 seconds we would track the 
+// number of 2 second increments to get to 10 seconds, 5 in this case.
+uint8_t wakeUpPeriod = 0; 
 
 //==============================================================================
 // Functions
@@ -299,19 +318,23 @@ void setup() {
 // Loop
 //==============================================================================
 void loop() {
-  // Time for next record.
-  logTime += 1000UL*SAMPLE_INTERVAL_MS;   // again, LOOK INTO THIS
-  //waitLog();              // If this is run while I2C is running it pops an error. Not sure why. 
-  powerOnPeripherals ();    // Power on sensor board (and RTC/SD) SD not currently being powered down with board. Where should we put it? 
-  delay(800);              // This delay should cover the reat time for the temp probe
-  Get_Temp();               // Get temperature from sensor
-  Get_Time();               // Get time string from RTC 
-  dateString ();            // Pull date from the get_time string. Can we move this into logData?
-  timeString ();            // Pull time from the get_time string. Can we move this into logData? 
-  inUseCardRemoval();       // Check to see if there is a card present. If not hold operations
-  logData();                // Write the data to the SD
-  forceData();              // Not sure? 
-  //viewSysMemory ();       //check system memory while programming 
-  powerOffPeripherals ();   // Power off sensor board
-  delay(interval);          // Delay for the user-specified interval
+  LowPower.powerDown(SLEEP_TIME_DIVIDER, ADC_OFF, BOD_OFF);
+  wakeUpPeriod++;
+  
+  if ( wakeUpPeriod >= WAKE_UP_TIMER ){
+	  // Time for next record.
+	  logTime += 1000UL*SAMPLE_INTERVAL_MS;   // again, LOOK INTO THIS
+	  //waitLog();              // If this is run while I2C is running it pops an error. Not sure why. 
+	  powerOnPeripherals ();    // Power on sensor board (and RTC/SD) SD not currently being powered down with board. Where should we put it? 
+	  delay(800);              // This delay should cover the read time for the temp probe
+	  Get_Temp();               // Get temperature from sensor
+	  Get_Time();               // Get time string from RTC 
+	  dateString ();            // Pull date from the get_time string. Can we move this into logData?
+	  timeString ();            // Pull time from the get_time string. Can we move this into logData? 
+	  inUseCardRemoval();       // Check to see if there is a card present. If not hold operations
+	  logData();                // Write the data to the SD
+	  forceData();              // Not sure? 
+	  //viewSysMemory ();       //check system memory while programming 
+	  powerOffPeripherals ();   // Power off sensor board
+  }
 }
