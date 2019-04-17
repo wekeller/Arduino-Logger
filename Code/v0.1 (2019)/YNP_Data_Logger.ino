@@ -1,8 +1,8 @@
 #include <SPI.h>             // SD interface/communication? 
 #include <Wire.h>            // I2C library
-#include <RTClib.h>          // real-time clock
+#include <RTClib.h>          // https://github.com/MrAlvin/RTClib
 #include <MemoryFree.h>      // monitor memory while programming
-#include "LowPower.h"     // Low Power module from Rocket Scream
+#include "LowPower.h"        // https://github.com/rocketscream/Low-Power
 #include "SdFat.h"           // SD Fat32 library
 
 //------------------------------------------------------------------------------
@@ -25,6 +25,8 @@ RTC_DS3231 RTC;                     //RTC object
 #define feature "Atomizer"          // Feature names sometimes include spaces. We need to make spaces underscores
 #define SampleIntervalMinutes 1  // Options: 1,2,3,4,5,6,10,12,15,20,30,60 ONLY (must be a divisor of 60)
 // this is the number of minutes the loggers sleeps between each sensor reading
+#define ECHO_TO_SERIAL // this define enables debugging output to the serial monitor when your logger is powered via USB/UART
+// comment out this define when you are deploying the logger and running on batteries
 
 //------------------------------------------------------------------------------
 // Additional Constants
@@ -356,6 +358,7 @@ void setup() {
   loggerName();             // Needs to be run after correct time has been called since the name is based on the format yyyymmdd_feature_serial
   intro();                  // Run intro script (Welcome to YNP Sensor Prototype)
   
+  
   pinMode(RTC_INTERRUPT_PIN,INPUT_PULLUP);// RTC alarms low, so need pullup on the D2 line 
   //Note using the internal pullup is not needed if you have hardware pullups on SQW line, and most RTC modules do.
   RTC.begin();  // RTC initialization:
@@ -397,25 +400,25 @@ void loop() {
     alarmMinute = 0;
     alarmHour++;
     if (alarmHour > 23) {
-    alarmHour = 0; 
-    // Seems like this isn't quite right. Should investigate more - Kevin
-  }
+      alarmHour = 0; 
+      // Seems like this isn't quite right. Should investigate more - Kevin
+    }
   }
   
   // Set the alarm
   RTC.setAlarm1Simple(alarmHour, alarmMinute);
   RTC.turnOnAlarm(1);
-//  if (RTC.checkAlarmEnabled(1)) {
-//    // For testing only
-//    #ifdef ECHO_TO_SERIAL
-//    Serial.print(F("RTC Alarm Enabled!"));
-//    Serial.print(F(" Going to sleep for : "));
-//    Serial.print(SampleIntervalMinutes);
-//    Serial.println(F(" minute(s)"));
-//    Serial.println();
-//    Serial.flush();//adds a carriage return & waits for buffer to empty
-//    #endif
-//  }
+  if (RTC.checkAlarmEnabled(1)) {
+    // For testing only
+    #ifdef ECHO_TO_SERIAL
+    Serial.print(F("RTC Alarm Enabled!"));
+    Serial.print(F(" Going to sleep for : "));
+    Serial.print(SampleIntervalMinutes);
+    Serial.println(F(" minute(s)"));
+    Serial.println();
+    Serial.flush();//adds a carriage return & waits for buffer to empty
+    #endif
+  }
 
   //——– sleep and wait for next RTC alarm ————–
   // Enable interrupt on pin2 & attach it to rtcISR function:
