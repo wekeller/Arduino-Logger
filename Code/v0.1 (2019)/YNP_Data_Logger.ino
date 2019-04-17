@@ -2,7 +2,7 @@
 #include <Wire.h>            // I2C library
 #include <RTClib.h>          // real-time clock
 #include <MemoryFree.h>      // monitor memory while programming
-#include "LowPower.h"		 // Low Power module from Rocket Scream
+#include "LowPower.h"     // Low Power module from Rocket Scream
 #include "SdFat.h"           // SD Fat32 library
 
 //------------------------------------------------------------------------------
@@ -16,13 +16,15 @@
 //------------------------------------------------------------------------------
 SdFat sd;                           //SDFat object
 SdFile file;                        //Log file
-RTC_DS3231 rtc;                     //RTC object
+RTC_DS3231 RTC;                     //RTC object
 
 //------------------------------------------------------------------------------
 // User Defined constants
 //------------------------------------------------------------------------------
 #define serial "987654321"          // SN of logger. These will probaby be shorter
 #define feature "Atomizer"          // Feature names sometimes include spaces. We need to make spaces underscores
+#define SampleIntervalMinutes 1  // Options: 1,2,3,4,5,6,10,12,15,20,30,60 ONLY (must be a divisor of 60)
+// this is the number of minutes the loggers sleeps between each sensor reading
 
 //------------------------------------------------------------------------------
 // Additional Constants
@@ -35,21 +37,6 @@ const uint8_t ANALOG_COUNT = 4;
 const int BAUD = 9600;              //default baud rate
 const int temp_time = 600;         //time to measure temperature. Look into how long it actually takes, but I think 1 sec is close to min
 const byte POWER = 3;               // Power pin to turn on sensor board
-
-// REVISION NEEDED!
-// Neeed to be able to have things in 5S intervals rather than predefined amounts
-
-
-const uint8_t SLEEP_TIME = 10; // Sleep time in seconds
-// Our options are limited to the ones listed here. The watchdog timer
-// Is only capable of sleeping for up to 8 seconds.
-const char SLEEP_TIME_DIVIDER = // SLEEP_1S; // 1 second wake up time
-								SLEEP_2S; // 2 second wake up time
-								// SLEEP_4S; // 4 second wake up time
-								// SLEEP_8S; // 8 second wake up time
-
-// This determines the humber of wake up cycles between readings.
-const uint8_t WAKE_UP_TIMER = (SLEEP_TIME / 2) - 1; // This is to be fixed in the future
 
 //------------------------------------------------------------------------------
 // Variables
@@ -73,6 +60,23 @@ bool alreadyBegan = false;          // SD.begin() misbehaves if not first call
 // seconds between readings but wake up every 2 seconds we would track the 
 // number of 2 second increments to get to 10 seconds, 5 in this case.
 uint8_t wakeUpPeriod = 0; 
+
+
+// variables for reading the RTC time & handling the INT(0) interrupt it generates
+#define DS3231_I2C_ADDRESS 0x68
+#define DS3231_CONTROL_REG 0x0E
+#define RTC_INTERRUPT_PIN 2
+uint8_t alarmHour;
+uint8_t alarmMinute;
+uint8_t alarmDay;
+char CycleTimeStamp[ ] = "0000/00/00,00:00"; //16 ascii characters (without seconds because they are always zeros on wakeup)
+volatile boolean clockInterrupt = false;  //this flag is set to true when the RTC interrupt handler is executed
+//variables for reading the DS3231 RTC temperature register
+float rtc_TEMP_degC;
+uint8_t tMSB = 0;
+uint8_t tLSB = 0;
+
+uint8_t bytebuffer1 = 0;
 
 //==============================================================================
 // Functions
@@ -296,6 +300,45 @@ void viewSysMemory () {
   Serial.println(freeMemory());
 }
 
+
+// This is the Interrupt subroutine that only executes when the RTC alarm goes off:
+void rtcISR() {
+  clockInterrupt = true;
+}
+
+// Enable Battery-Backed Square-Wave Enable on the RTC module: 
+// Bit 6 (Battery-Backed Square-Wave Enable) of DS3231_CONTROL_REG 0x0E, can be set to 1 
+// When set to 1, it forces the wake-up alarms to occur when running the RTC from the back up battery alone. 
+// [note: This bit is usually disabled (logic 0) when power is FIRST applied]
+//
+void enableRTCAlarmsonBackupBattery(){
+  Wire.beginTransmission(DS3231_I2C_ADDRESS);// Attention RTC 
+  Wire.write(DS3231_CONTROL_REG);            // move the memory pointer to CONTROL_REG
+  Wire.endTransmission();                    // complete the ‘move memory pointer’ transaction
+  Wire.requestFrom(DS3231_I2C_ADDRESS,1);    // request data from register
+  uint8_t resisterData = Wire.read();           // byte from registerAddress
+  bitSet(resisterData, 6);                   // Change bit 6 to a 1 to enable
+  Wire.beginTransmission(DS3231_I2C_ADDRESS);// Attention RTC
+  Wire.write(DS3231_CONTROL_REG);            // target the register
+  Wire.write(resisterData);                  // put changed byte back into CONTROL_REG
+  Wire.endTransmission();
+}
+
+void clearClockTrigger()   // from http://forum.arduino.cc/index.php?topic=109062.0
+{
+  Wire.beginTransmission(0x68);   //Tell devices on the bus we are talking to the DS3231
+  Wire.write(0x0F);               //Tell the device which address we want to read or write
+  Wire.endTransmission();         //Before you can write to and clear the alarm flag you have to read the flag first!
+  Wire.requestFrom(0x68,1);       //Read one byte
+  bytebuffer1=Wire.read();        //In this example we are not interest in actually using the byte
+  Wire.beginTransmission(0x68);   //Tell devices on the bus we are talking to the DS3231 
+  Wire.write(0x0F);               //Status Register: Bit 3: zero disables 32kHz, Bit 7: zero enables the main oscilator
+  Wire.write(0b00000000);         //Bit1: zero clears Alarm 2 Flag (A2F), Bit 0: zero clears Alarm 1 Flag (A1F)
+  Wire.endTransmission();
+  clockInterrupt=false;           //Finally clear the flag we used to indicate the trigger occurred
+}
+
+
 //==============================================================================
 // Setup
 //==============================================================================
@@ -306,35 +349,80 @@ void setup() {
   initializeCard();         // start sd card. upon reinsertion of sd card it will create a new file even if one exists
   setLogTime ();            // I'm not 100% sure how this works or what it ties into. Look into this
   Wire.begin();             // Start I2C communication (RTC and sensors)
-  rtc.begin();              // Start Real-Time Clock
+  RTC.begin();              // Start Real-Time Clock
   Get_Time();               // Grab a time from the RTC. Will likely be wrong the first pull, so we pull it twice
   delay(200);               // Give the RTC a sec to send a new signal
   Get_Time();               // This time is almost never correct on the first call, so by calling it here the first reading will be correct in the loop
   loggerName();             // Needs to be run after correct time has been called since the name is based on the format yyyymmdd_feature_serial
   intro();                  // Run intro script (Welcome to YNP Sensor Prototype)
+  
+  pinMode(RTC_INTERRUPT_PIN,INPUT_PULLUP);// RTC alarms low, so need pullup on the D2 line 
+  //Note using the internal pullup is not needed if you have hardware pullups on SQW line, and most RTC modules do.
+  RTC.begin();  // RTC initialization:
+  clearClockTrigger(); //stops RTC from holding the interrupt low after power reset occured
+  RTC.turnOffAlarm(1);
+  DateTime now = RTC.now();
+  sprintf(CycleTimeStamp, "%04d/%02d/%02d %02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute());
+  enableRTCAlarmsonBackupBattery(); // this is only needed if you cut the VCC pin supply on the DS3231
 }
 
 //==============================================================================
 // Loop
 //==============================================================================
 void loop() {
-  LowPower.powerDown(SLEEP_TIME_DIVIDER, ADC_OFF, BOD_OFF);
-  wakeUpPeriod++;
   
-  if ( wakeUpPeriod >= WAKE_UP_TIMER ){
-	  // Time for next record.
-	  logTime += 1000UL*SAMPLE_INTERVAL_MS;   // again, LOOK INTO THIS
-	  //waitLog();              // If this is run while I2C is running it pops an error. Not sure why. 
-	  powerOnPeripherals ();    // Power on sensor board (and RTC/SD) SD not currently being powered down with board. Where should we put it? 
-	  delay(800);              // This delay should cover the read time for the temp probe
-	  Get_Temp();               // Get temperature from sensor
-	  Get_Time();               // Get time string from RTC 
-	  dateString ();            // Pull date from the get_time string. Can we move this into logData?
-	  timeString ();            // Pull time from the get_time string. Can we move this into logData? 
-	  inUseCardRemoval();       // Check to see if there is a card present. If not hold operations
-	  logData();                // Write the data to the SD
-	  forceData();              // Not sure? 
-	  //viewSysMemory ();       //check system memory while programming 
-	  powerOffPeripherals ();   // Power off sensor board
+  // Time for next record.
+  DateTime now = RTC.now(); //this reads the time from the RTC
+  logTime += 1000UL*SAMPLE_INTERVAL_MS;   // again, LOOK INTO THIS
+  //waitLog();              // If this is run while I2C is running it pops an error. Not sure why. 
+  powerOnPeripherals ();    // Power on sensor board (and RTC/SD) SD not currently being powered down with board. Where should we put it? 
+  delay(800);              // This delay should cover the read time for the temp probe
+  Get_Temp();               // Get temperature from sensor
+  Get_Time();               // Get time string from RTC 
+  dateString ();            // Pull date from the get_time string. Can we move this into logData?
+  timeString ();            // Pull time from the get_time string. Can we move this into logData? 
+  inUseCardRemoval();       // Check to see if there is a card present. If not hold operations
+  logData();                // Write the data to the SD
+  forceData();              // Not sure? 
+  //viewSysMemory ();       //check system memory while programming 
+  powerOffPeripherals ();   // Power off sensor board
+  
+  // Set the next alarm time
+  alarmHour = now.hour();
+  alarmMinute = now.minute() + SampleIntervalMinutes;
+  alarmDay = now.day();
+  
+  // Check for rollovers
+  if (alarmMinute > 59) {
+    alarmMinute = 0;
+    alarmHour++;
+    if (alarmHour > 23) {
+    alarmHour = 0; 
+    // Seems like this isn't quite right. Should investigate more - Kevin
   }
+  }
+  
+  // Set the alarm
+  RTC.setAlarm1Simple(alarmHour, alarmMinute);
+  RTC.turnOnAlarm(1);
+//  if (RTC.checkAlarmEnabled(1)) {
+//    // For testing only
+//    #ifdef ECHO_TO_SERIAL
+//    Serial.print(F("RTC Alarm Enabled!"));
+//    Serial.print(F(" Going to sleep for : "));
+//    Serial.print(SampleIntervalMinutes);
+//    Serial.println(F(" minute(s)"));
+//    Serial.println();
+//    Serial.flush();//adds a carriage return & waits for buffer to empty
+//    #endif
+//  }
+
+  //——– sleep and wait for next RTC alarm ————–
+  // Enable interrupt on pin2 & attach it to rtcISR function:
+  attachInterrupt(0, rtcISR, LOW);
+  // Enter power down state with ADC module disabled to save power:
+  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_ON);
+  //processor starts HERE AFTER THE RTC ALARM WAKES IT UP
+  detachInterrupt(0); // immediately disable the interrupt on waking
+  //Interupt woke processor, now go back to the start of the main loop
 }
